@@ -1,0 +1,197 @@
+<!doctype html>
+<html lang="nl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#000000">
+<title>Techniek – proef b: spraak</title>
+<script>
+/* ======================================================================
+   PROEF B – spraak opnemen en afspelen. Welke opnameformaten geeft Chrome
+   op dit toestel, en hoe groot is een opname van 30 seconden?
+   Geen onderdeel van de app. Eigen opslagnamen (techniek-proef).
+   ====================================================================== */
+var CONFIG = {
+  PROEF_VERSION: "0.1",
+  // Formaten die nagekeken worden, in volgorde van voorkeur.
+  TYPES: ["audio/webm;codecs=opus", "audio/webm", "audio/mp4;codecs=mp4a.40.2", "audio/mp4;codecs=opus", "audio/mp4", "audio/ogg;codecs=opus", "audio/wav"],
+  BITRATES: [0, 16000, 24000, 32000],   // 0 = de standaard van de browser
+  MAX_SECONDS: 120,                      // een opname stopt vanzelf
+  SLICE_MS: 1000                         // om de seconde een stuk: bij een crash is niet alles weg
+};
+</script>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: Roboto, "Segoe UI", system-ui, sans-serif; background: #000; color: #fff; padding: 8px; font-size: 17px; }
+  h1 { font-size: 22px; font-weight: 900; margin-bottom: 6px; }
+  p, li { color: #bdbdbd; font-weight: 500; margin: 6px 0; }
+  ol { padding-left: 22px; }
+  button { display: block; width: 100%; min-height: 64px; margin: 8px 0; border: 0; border-radius: 8px; background: #fff; color: #000; font: inherit; font-size: 22px; font-weight: 900; }
+  button.rec { background: #d00000; color: #fff; }
+  button.sec { background: #333; color: #fff; min-height: 48px; font-size: 17px; }
+  select, input[type=text] { width: 100%; font: inherit; padding: 8px; border-radius: 6px; border: 2px solid #444; background: #111; color: #fff; margin: 4px 0; }
+  #res { margin: 8px 0; padding: 8px; border-radius: 8px; background: #1a1a1a; font-weight: 700; white-space: pre-wrap; font-variant-numeric: tabular-nums; }
+  #res.ok { background: #0a8f2e; } #res.bad { background: #d00000; } #res.busy { background: #ff9800; color: #000; }
+  .item { border-top: 1px solid #333; padding: 8px 0; }
+  .item audio { width: 100%; margin-top: 4px; }
+  .item .m { font-size: 14px; color: #bdbdbd; font-variant-numeric: tabular-nums; }
+  .item .row { display: flex; gap: 6px; } .item .row button { min-height: 44px; font-size: 15px; margin: 4px 0; }
+  textarea { width: 100%; height: 130px; background: #111; color: #fff; border: 2px solid #444; border-radius: 6px; font: 13px monospace; padding: 6px; }
+  small { color: #8a8a8a; }
+</style>
+</head>
+<body>
+<h1>Proef b: spraak</h1>
+<ol>
+  <li>Kies een formaat (laat de eerste keuze staan) en tik op <b>OPNEMEN</b>. Chrome vraagt één keer toegang tot de microfoon.</li>
+  <li>Spreek <b>30 seconden</b> aan de lijn, met de machine in werking, zoals je een herstelling zou beschrijven. Tik op <b>STOP</b>.</li>
+  <li>Speel de opname af. Is ze verstaanbaar?</li>
+  <li>Maak er drie, op drie plekken. Stuur ze met de knop naar het proefscript (voor de omzetting naar tekst).</li>
+  <li>Sluit Chrome volledig en open de pagina opnieuw: de opnames moeten er nog staan.</li>
+</ol>
+
+<select id="type"></select>
+<select id="rate"></select>
+<button id="go">OPNEMEN</button>
+<div id="res">Klaar.</div>
+<div id="list"></div>
+
+<p><b>Proefscript</b> (voor de knop "Naar script"):</p>
+<input type="text" id="url" placeholder="Adres van het proefscript (…/exec)" autocomplete="off" autocapitalize="off" spellcheck="false">
+<input type="text" id="key" placeholder="Proefsleutel" autocomplete="off" autocapitalize="off" spellcheck="false">
+<button class="sec" id="wipe">Alle proefopnames wissen</button>
+
+<p>Resultaat om te kopiëren:</p>
+<textarea id="dump" readonly></textarea>
+<small id="ver"></small>
+
+<script>
+(function () {
+  'use strict';
+  var $ = function (id) { return document.getElementById(id); };
+  $('ver').textContent = 'proef b v' + CONFIG.PROEF_VERSION;
+  var SET = 'techniek.proef.settings';
+  var settings = {}; try { settings = JSON.parse(localStorage.getItem(SET) || '{}') || {}; } catch (e) {}
+  $('url').value = settings.url || ''; $('key').value = settings.key || '';
+  function saveSettings() { settings.url = $('url').value.trim(); settings.key = $('key').value.trim(); try { localStorage.setItem(SET, JSON.stringify(settings)); } catch (e) {} }
+  function say(text, cls) { $('res').textContent = text; $('res').className = cls || ''; }
+
+  /* ---------------- Welke formaten kan dit toestel? ---------------- */
+  var hasMR = typeof MediaRecorder !== 'undefined';
+  var support = CONFIG.TYPES.map(function (t) { var ok = false; try { ok = hasMR && MediaRecorder.isTypeSupported(t); } catch (e) {} return { type: t, ok: ok }; });
+  support.forEach(function (s) { if (!s.ok) return; var o = document.createElement('option'); o.value = s.type; o.textContent = s.type; $('type').appendChild(o); });
+  var def = document.createElement('option'); def.value = ''; def.textContent = '(standaard van de browser)'; $('type').appendChild(def);
+  CONFIG.BITRATES.forEach(function (b) { var o = document.createElement('option'); o.value = b; o.textContent = b ? (b / 1000) + ' kbit/s' : 'bitrate: standaard'; $('rate').appendChild(o); });
+
+  /* ---------------- IndexedDB ---------------- */
+  var dbP = null;
+  function openDb() {
+    if (dbP) return dbP;
+    dbP = new Promise(function (resolve, reject) {
+      var req = indexedDB.open('techniek-proef', 1);
+      req.onupgradeneeded = function () {
+        var db = req.result;
+        if (!db.objectStoreNames.contains('fotos')) db.createObjectStore('fotos', { keyPath: 'seq', autoIncrement: true });
+        if (!db.objectStoreNames.contains('audio')) db.createObjectStore('audio', { keyPath: 'seq', autoIncrement: true });
+      };
+      req.onsuccess = function () { resolve(req.result); };
+      req.onerror = function () { reject(req.error); };
+    });
+    return dbP;
+  }
+  function tx(mode, work) {
+    return openDb().then(function (db) {
+      return new Promise(function (resolve, reject) {
+        var t, result;
+        try { t = db.transaction(['audio'], mode, { durability: 'strict' }); } catch (e) { t = db.transaction(['audio'], mode); }
+        t.oncomplete = function () { resolve(result); };
+        t.onerror = t.onabort = function () { reject(t.error || new Error('opslagfout')); };
+        result = work(t.objectStore('audio'));
+      });
+    });
+  }
+
+  /* ---------------- Opnemen ---------------- */
+  var rec = null, stream = null, chunks = [], startedAt = 0, tick = null, stopTimer = null, info = {};
+  function start() {
+    if (!hasMR || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) { say('Dit toestel kan niet opnemen (geen MediaRecorder). Open de pagina via https in Chrome.', 'bad'); return; }
+    say('Microfoon vragen…', 'busy');
+    // Ruisonderdrukking en automatische versterking aan: bedoeld voor spraak in lawaai.
+    navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 } }).then(function (s) {
+      stream = s; chunks = [];
+      var opts = {}, type = $('type').value, rate = Number($('rate').value);
+      if (type) opts.mimeType = type;
+      if (rate) opts.audioBitsPerSecond = rate;
+      rec = new MediaRecorder(s, opts);
+      var track = s.getAudioTracks()[0], ts = track && track.getSettings ? track.getSettings() : {};
+      info = { gevraagd: type || '(standaard)', bitrateGevraagd: rate || 0, mime: rec.mimeType, bitrate: rec.audioBitsPerSecond || 0, micro: (ts.sampleRate || '?') + ' Hz, ' + (ts.channelCount || '?') + ' kanaal, ruisonderdr. ' + ts.noiseSuppression + ', agc ' + ts.autoGainControl };
+      rec.ondataavailable = function (e) { if (e.data && e.data.size) chunks.push(e.data); };
+      rec.onstop = finish;
+      rec.onerror = function (e) { say('Opnamefout: ' + (e.error && e.error.name || e), 'bad'); };
+      rec.start(CONFIG.SLICE_MS);
+      startedAt = performance.now();
+      $('go').textContent = 'STOP'; $('go').className = 'rec';
+      tick = setInterval(function () { var sec = (performance.now() - startedAt) / 1000; say('OPNAME ' + sec.toFixed(0) + ' s · ' + rec.mimeType + (sec >= 30 ? '  (30 s bereikt)' : ''), 'busy'); }, 250);
+      stopTimer = setTimeout(stop, CONFIG.MAX_SECONDS * 1000);
+    }, function (e) { say('Geen toegang tot de microfoon: ' + (e && e.name || e) + '. Sta ze toe via het slotje naast het adres.', 'bad'); });
+  }
+  function stop() { clearInterval(tick); clearTimeout(stopTimer); try { if (rec && rec.state !== 'inactive') rec.stop(); } catch (e) {} }
+  function finish() {
+    var ms = performance.now() - startedAt;
+    if (stream) stream.getTracks().forEach(function (t) { t.stop(); });
+    $('go').textContent = 'OPNEMEN'; $('go').className = '';
+    var blob = new Blob(chunks, { type: info.mime || 'audio/webm' });
+    var item = { ts: Date.now(), blob: blob, ms: Math.round(ms), info: info };
+    var t0 = performance.now();
+    tx('readwrite', function (s) { s.add(item); }).then(function () {
+      say('BEWAARD: ' + (ms / 1000).toFixed(1) + ' s, ' + Math.round(blob.size / 1024) + ' kB, op schijf in ' + Math.round(performance.now() - t0) + ' ms', 'ok');
+      render();
+    }, function (e) { say('NIET BEWAARD: ' + (e && e.message || e), 'bad'); });
+  }
+  $('go').addEventListener('click', function () { if (rec && rec.state === 'recording') stop(); else start(); });
+
+  /* ---------------- Lijst ---------------- */
+  function ext(mime) { return /mp4/.test(mime) ? 'm4a' : /ogg/.test(mime) ? 'ogg' : /wav/.test(mime) ? 'wav' : 'webm'; }
+  function b64(blob) { return new Promise(function (res, rej) { var fr = new FileReader(); fr.onload = function () { res(String(fr.result).split(',')[1]); }; fr.onerror = rej; fr.readAsDataURL(blob); }); }
+  function send(x) {
+    saveSettings();
+    if (!settings.url || !settings.key) { say('Vul eerst het adres en de proefsleutel in.', 'bad'); return; }
+    say('Verzenden…', 'busy');
+    var t0 = performance.now(), mime = (x.blob.type || 'audio/webm').split(';')[0];
+    b64(x.blob).then(function (data) {
+      return fetch(settings.url, { method: 'POST', headers: { 'Content-Type': 'text/plain;charset=utf-8' }, redirect: 'follow', cache: 'no-store',
+        body: JSON.stringify({ key: settings.key, action: 'upload', soort: 'audio', mime: mime, naam: 'opname-' + x.ts + '.' + ext(mime), data: data }) });
+    }).then(function (r) { return r.json(); }).then(function (j) {
+      if (!j.ok) throw new Error(j.error || 'geweigerd');
+      say('In Drive: ' + j.naam + ' (' + Math.round(performance.now() - t0) + ' ms)', 'ok');
+    }).catch(function (e) { say('Verzenden mislukt: ' + (e && e.message || e), 'bad'); });
+  }
+  function render() {
+    tx('readonly', function (s) { var out = []; s.getAll().onsuccess = function (e) { out.push.apply(out, e.target.result || []); }; return out; }).then(function (all) {
+      var box = $('list'); box.textContent = '';
+      var lines = ['Proef b v' + CONFIG.PROEF_VERSION + ' – ' + new Date().toLocaleString('nl-BE'), navigator.userAgent, 'Ondersteunde formaten:'];
+      support.forEach(function (s) { lines.push('  ' + (s.ok ? 'JA   ' : 'nee  ') + s.type); });
+      lines.push('Opnames:');
+      all.slice().reverse().forEach(function (x) {
+        var sec = x.ms / 1000, kB = x.blob.size / 1024, kbps = x.blob.size * 8 / sec / 1000;
+        var meta = sec.toFixed(1) + ' s · ' + Math.round(kB) + ' kB · ' + kbps.toFixed(1) + ' kbit/s · 30 s ≈ ' + Math.round(kbps * 30 / 8) + ' kB · ' + (x.blob.type || '?');
+        var d = document.createElement('div'); d.className = 'item';
+        var m = document.createElement('div'); m.className = 'm'; m.textContent = '#' + x.seq + ' · ' + meta; d.appendChild(m);
+        var a = document.createElement('audio'); a.controls = true; a.preload = 'metadata'; a.src = URL.createObjectURL(x.blob); d.appendChild(a);
+        var row = document.createElement('div'); row.className = 'row';
+        var b1 = document.createElement('button'); b1.className = 'sec'; b1.textContent = 'Naar script'; b1.addEventListener('click', function () { send(x); }); row.appendChild(b1);
+        var b2 = document.createElement('button'); b2.className = 'sec'; b2.textContent = 'Downloaden';
+        b2.addEventListener('click', function () { var l = document.createElement('a'); l.href = a.src; l.download = 'opname-' + x.ts + '.' + ext(x.blob.type || ''); l.click(); }); row.appendChild(b2);
+        d.appendChild(row); box.appendChild(d);
+        lines.push('  #' + x.seq + ' ' + meta + ' | gevraagd ' + x.info.gevraagd + ' @' + (x.info.bitrateGevraagd || 'std') + ' | recorder ' + x.info.bitrate + ' bit/s | micro ' + x.info.micro);
+      });
+      $('dump').value = lines.join('\n');
+    });
+  }
+  $('wipe').addEventListener('click', function () { tx('readwrite', function (s) { s.clear(); }).then(function () { say('Gewist.'); render(); }); });
+  if (!hasMR) say('Dit toestel heeft geen MediaRecorder.', 'bad');
+  render();
+})();
+</script>
+</body>
+</html>

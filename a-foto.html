@@ -1,0 +1,211 @@
+<!doctype html>
+<html lang="nl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#000000">
+<title>Techniek – proef a: foto</title>
+<script>
+/* ======================================================================
+   PROEF A – foto nemen, verkleinen, in IndexedDB bewaren, tijd meten.
+   Geen onderdeel van de app. Eigen opslagnamen (techniek-proef), zodat de
+   andere apps op hetzelfde adres ongemoeid blijven.
+   ====================================================================== */
+var CONFIG = {
+  PROEF_VERSION: "0.1",
+  MAX_SIDE: 1600,        // lange zijde van de bewaarde foto
+  JPEG_QUALITY: 0.85,
+  THUMB_SIDE: 240,       // lange zijde van de miniatuur
+  THUMB_QUALITY: 0.7,
+  TARGET_MS: 1000        // eis uit deel 11: van foto tot "bewaard" binnen 1 seconde
+};
+</script>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: Roboto, "Segoe UI", system-ui, sans-serif; background: #000; color: #fff; padding: 8px; font-size: 17px; }
+  h1 { font-size: 22px; font-weight: 900; margin-bottom: 6px; }
+  p, li { color: #bdbdbd; font-weight: 500; margin: 6px 0; }
+  ol { padding-left: 22px; }
+  button, .btn { display: block; width: 100%; min-height: 64px; margin: 8px 0; border: 0; border-radius: 8px; background: #fff; color: #000; font: inherit; font-size: 22px; font-weight: 900; text-align: center; line-height: 64px; }
+  button.sec { background: #333; color: #fff; min-height: 48px; line-height: 48px; font-size: 17px; }
+  input[type=file] { display: none; }
+  input[type=text] { width: 100%; font: inherit; padding: 8px; border-radius: 6px; border: 2px solid #444; background: #111; color: #fff; margin: 4px 0; }
+  #res { margin: 8px 0; padding: 8px; border-radius: 8px; background: #1a1a1a; font-weight: 700; white-space: pre-wrap; font-variant-numeric: tabular-nums; }
+  #res.ok { background: #0a8f2e; } #res.bad { background: #d00000; }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; font-variant-numeric: tabular-nums; }
+  th, td { text-align: right; padding: 3px 4px; border-bottom: 1px solid #333; }
+  th:first-child, td:first-child { text-align: left; }
+  #thumbs { display: flex; flex-wrap: wrap; gap: 4px; margin: 8px 0; }
+  #thumbs img { height: 90px; border-radius: 4px; }
+  textarea { width: 100%; height: 110px; background: #111; color: #fff; border: 2px solid #444; border-radius: 6px; font: 13px monospace; padding: 6px; }
+  small { color: #8a8a8a; }
+</style>
+</head>
+<body>
+<h1>Proef a: foto</h1>
+<ol>
+  <li>Tik op <b>FOTO NEMEN</b> en neem een foto van een machine. Doe dat minstens 5 keer.</li>
+  <li>Kijk naar de regel <b>totaal</b>: dat is de tijd van "foto aanvaard" tot "op schijf". Doel: onder 1000 ms.</li>
+  <li>Sluit Chrome volledig, open de pagina opnieuw: de foto's moeten er nog staan.</li>
+  <li>Kopieer het resultaat onderaan en bezorg het.</li>
+</ol>
+
+<label class="btn" for="cam">FOTO NEMEN</label>
+<input type="file" id="cam" accept="image/*" capture="environment">
+<div id="res">Nog geen foto.</div>
+
+<table id="tab"><thead><tr><th>#</th><th>bron</th><th>lezen</th><th>verkl.</th><th>jpeg</th><th>mini</th><th>schijf</th><th>totaal</th><th>kB</th></tr></thead><tbody></tbody></table>
+<div id="thumbs"></div>
+
+<p><b>Optioneel:</b> stuur de laatste foto naar het proefscript (nodig voor proef c, de pdf).</p>
+<input type="text" id="url" placeholder="Adres van het proefscript (…/exec)" autocomplete="off" autocapitalize="off" spellcheck="false">
+<input type="text" id="key" placeholder="Proefsleutel" autocomplete="off" autocapitalize="off" spellcheck="false">
+<button class="sec" id="send">Laatste foto naar het script sturen</button>
+<button class="sec" id="wipe">Alle proeffoto's wissen</button>
+
+<p>Resultaat om te kopiëren:</p>
+<textarea id="dump" readonly></textarea>
+<small id="ver"></small>
+
+<script>
+(function () {
+  'use strict';
+  var $ = function (id) { return document.getElementById(id); };
+  $('ver').textContent = 'proef a v' + CONFIG.PROEF_VERSION;
+  var SET = 'techniek.proef.settings';
+  var settings = {}; try { settings = JSON.parse(localStorage.getItem(SET) || '{}') || {}; } catch (e) {}
+  $('url').value = settings.url || ''; $('key').value = settings.key || '';
+  function saveSettings() { settings.url = $('url').value.trim(); settings.key = $('key').value.trim(); try { localStorage.setItem(SET, JSON.stringify(settings)); } catch (e) {} }
+
+  /* ---------------- IndexedDB: zelfde aanpak als de wachtrij van Palletscan ---------------- */
+  var dbP = null;
+  function openDb() {
+    if (dbP) return dbP;
+    dbP = new Promise(function (resolve, reject) {
+      var req = indexedDB.open('techniek-proef', 1);
+      req.onupgradeneeded = function () {
+        var db = req.result;
+        if (!db.objectStoreNames.contains('fotos')) db.createObjectStore('fotos', { keyPath: 'seq', autoIncrement: true });
+        if (!db.objectStoreNames.contains('audio')) db.createObjectStore('audio', { keyPath: 'seq', autoIncrement: true });
+      };
+      req.onsuccess = function () { resolve(req.result); };
+      req.onerror = function () { reject(req.error); };
+    });
+    return dbP;
+  }
+  // De belofte is pas vervuld als de transactie op schijf staat (durability strict).
+  function tx(mode, work) {
+    return openDb().then(function (db) {
+      return new Promise(function (resolve, reject) {
+        var t, result;
+        try { t = db.transaction(['fotos'], mode, { durability: 'strict' }); } catch (e) { t = db.transaction(['fotos'], mode); }
+        t.oncomplete = function () { resolve(result); };
+        t.onerror = t.onabort = function () { reject(t.error || new Error('opslagfout')); };
+        result = work(t.objectStore('fotos'));
+      });
+    });
+  }
+
+  /* ---------------- Verkleinen ---------------- */
+  function fit(w, h, max) { var s = Math.min(1, max / Math.max(w, h)); return { w: Math.round(w * s), h: Math.round(h * s) }; }
+  function toBlob(canvas, q) { return new Promise(function (res, rej) { canvas.toBlob(function (b) { b ? res(b) : rej(new Error('jpeg mislukt')); }, 'image/jpeg', q); }); }
+  // Decoderen: createImageBitmap volgt de EXIF-oriëntatie (imageOrientation "from-image").
+  // Lukt dat niet, dan via een <img>.
+  function decode(file) {
+    if (window.createImageBitmap) {
+      return createImageBitmap(file, { imageOrientation: 'from-image' }).then(function (bmp) { return { src: bmp, w: bmp.width, h: bmp.height, how: 'bitmap', close: function () { bmp.close && bmp.close(); } }; })
+        .catch(function () { return decodeImg(file); });
+    }
+    return decodeImg(file);
+  }
+  function decodeImg(file) {
+    return new Promise(function (res, rej) {
+      var url = URL.createObjectURL(file), img = new Image();
+      img.onload = function () { res({ src: img, w: img.naturalWidth, h: img.naturalHeight, how: 'img', close: function () { URL.revokeObjectURL(url); } }); };
+      img.onerror = function () { URL.revokeObjectURL(url); rej(new Error('foto niet leesbaar')); };
+      img.src = url;
+    });
+  }
+  function draw(src, w, h) {
+    var cv = document.createElement('canvas'); cv.width = w; cv.height = h;
+    var ctx = cv.getContext('2d'); ctx.imageSmoothingQuality = 'high'; ctx.drawImage(src, 0, 0, w, h);
+    return cv;
+  }
+
+  var runs = [];
+  function handle(file) {
+    var t0 = performance.now(), m = { bron: Math.round(file.size / 1024) + ' kB ' + (file.type || '?') };
+    $('res').className = ''; $('res').textContent = 'Bezig…';
+    var dec, big, rec;
+    return decode(file).then(function (d) {
+      dec = d; m.lezen = performance.now() - t0; m.px = d.w + '×' + d.h + ' (' + d.how + ')';
+      var t1 = performance.now(), f = fit(d.w, d.h, CONFIG.MAX_SIDE);
+      big = draw(d.src, f.w, f.h); m.verkl = performance.now() - t1; m.uit = f.w + '×' + f.h;
+      var t2 = performance.now();
+      return toBlob(big, CONFIG.JPEG_QUALITY).then(function (b) { m.jpeg = performance.now() - t2; return b; });
+    }).then(function (blob) {
+      var t3 = performance.now(), f = fit(big.width, big.height, CONFIG.THUMB_SIDE);
+      return toBlob(draw(big, f.w, f.h), CONFIG.THUMB_QUALITY).then(function (th) {
+        m.mini = performance.now() - t3; dec.close();
+        rec = { ts: Date.now(), blob: blob, thumb: th, w: big.width, h: big.height };
+        var t4 = performance.now();
+        return tx('readwrite', function (s) { s.add(rec); }).then(function () { m.schijf = performance.now() - t4; });
+      });
+    }).then(function () {
+      m.totaal = performance.now() - t0; m.kB = Math.round(rec.blob.size / 1024);
+      runs.push(m);
+      var ok = m.totaal <= CONFIG.TARGET_MS;
+      $('res').className = ok ? 'ok' : 'bad';
+      $('res').textContent = 'BEWAARD in ' + Math.round(m.totaal) + ' ms ' + (ok ? '(binnen de eis)' : '(TRAGER dan 1000 ms)') + '\nbron ' + m.px + ' → ' + m.uit + ', ' + m.kB + ' kB';
+      render();
+    }).catch(function (e) { $('res').className = 'bad'; $('res').textContent = 'MISLUKT: ' + (e && e.message || e); });
+  }
+
+  function r(n) { return n == null ? '' : Math.round(n); }
+  function render() {
+    var tb = $('tab').tBodies[0]; tb.textContent = '';
+    runs.forEach(function (m, i) {
+      var tr = document.createElement('tr');
+      [i + 1, m.bron, r(m.lezen), r(m.verkl), r(m.jpeg), r(m.mini), r(m.schijf), r(m.totaal), m.kB].forEach(function (v) { var td = document.createElement('td'); td.textContent = v; tr.appendChild(td); });
+      tb.appendChild(tr);
+    });
+    tx('readonly', function (s) { var out = []; s.getAll().onsuccess = function (e) { out.push.apply(out, e.target.result || []); }; return out; }).then(function (all) {
+      var box = $('thumbs'); box.textContent = '';
+      var bytes = 0;
+      all.forEach(function (x) { bytes += x.blob.size + x.thumb.size; var img = new Image(); img.src = URL.createObjectURL(x.thumb); box.appendChild(img); });
+      var lines = ['Proef a v' + CONFIG.PROEF_VERSION + ' – ' + new Date().toLocaleString('nl-BE'), navigator.userAgent,
+        'toestel: ' + (navigator.deviceMemory || '?') + ' GB, ' + (navigator.hardwareConcurrency || '?') + ' kernen',
+        'op schijf: ' + all.length + ' foto\'s, ' + Math.round(bytes / 1024) + ' kB'];
+      runs.forEach(function (m, i) { lines.push('#' + (i + 1) + ' bron ' + m.bron + ' ' + m.px + ' → ' + m.uit + ' ' + m.kB + ' kB | lezen ' + r(m.lezen) + ' verkl ' + r(m.verkl) + ' jpeg ' + r(m.jpeg) + ' mini ' + r(m.mini) + ' schijf ' + r(m.schijf) + ' TOTAAL ' + r(m.totaal) + ' ms'); });
+      if (navigator.storage && navigator.storage.estimate) navigator.storage.estimate().then(function (e) { lines.push('opslag: ' + Math.round((e.usage || 0) / 1048576) + ' MB gebruikt van ' + Math.round((e.quota || 0) / 1048576) + ' MB'); $('dump').value = lines.join('\n'); });
+      $('dump').value = lines.join('\n');
+    });
+  }
+
+  $('cam').addEventListener('change', function () { var f = this.files && this.files[0]; this.value = ''; if (f) handle(f); });
+  $('wipe').addEventListener('click', function () { tx('readwrite', function (s) { s.clear(); }).then(function () { runs = []; $('res').className = ''; $('res').textContent = 'Gewist.'; render(); }); });
+
+  function b64(blob) { return new Promise(function (res, rej) { var fr = new FileReader(); fr.onload = function () { res(String(fr.result).split(',')[1]); }; fr.onerror = rej; fr.readAsDataURL(blob); }); }
+  $('send').addEventListener('click', function () {
+    saveSettings();
+    if (!settings.url || !settings.key) { $('res').className = 'bad'; $('res').textContent = 'Vul eerst het adres en de proefsleutel in.'; return; }
+    tx('readonly', function (s) { var out = {}; s.openCursor(null, 'prev').onsuccess = function (e) { if (e.target.result) out.rec = e.target.result.value; }; return out; }).then(function (o) {
+      if (!o.rec) throw new Error('nog geen foto');
+      $('res').className = ''; $('res').textContent = 'Verzenden…';
+      var t0 = performance.now();
+      return b64(o.rec.blob).then(function (data) {
+        // text/plain vermijdt een CORS-preflight, die Apps Script niet beantwoordt.
+        return fetch(settings.url, { method: 'POST', headers: { 'Content-Type': 'text/plain;charset=utf-8' }, redirect: 'follow', cache: 'no-store',
+          body: JSON.stringify({ key: settings.key, action: 'upload', soort: 'foto', mime: 'image/jpeg', naam: 'foto-' + o.rec.ts + '.jpg', data: data }) });
+      }).then(function (resp) { return resp.json(); }).then(function (j) {
+        if (!j.ok) throw new Error(j.error || 'geweigerd');
+        $('res').className = 'ok'; $('res').textContent = 'In Drive: ' + j.naam + ' (' + Math.round(performance.now() - t0) + ' ms voor ' + Math.round(o.rec.blob.size / 1024) + ' kB)';
+      });
+    }).catch(function (e) { $('res').className = 'bad'; $('res').textContent = 'Verzenden mislukt: ' + (e && e.message || e); });
+  });
+
+  render();
+})();
+</script>
+</body>
+</html>
