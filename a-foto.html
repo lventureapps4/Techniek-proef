@@ -12,7 +12,7 @@
    andere apps op hetzelfde adres ongemoeid blijven.
    ====================================================================== */
 var CONFIG = {
-  PROEF_VERSION: "0.1",
+  PROEF_VERSION: "0.2",
   MAX_SIDE: 1600,        // lange zijde van de bewaarde foto
   JPEG_QUALITY: 0.85,
   THUMB_SIDE: 240,       // lange zijde van de miniatuur
@@ -44,8 +44,10 @@ var CONFIG = {
 <body>
 <h1>Proef a: foto</h1>
 <ol>
-  <li>Tik op <b>FOTO NEMEN</b> en neem een foto van een machine. Doe dat minstens 5 keer.</li>
-  <li>Kijk naar de regel <b>totaal</b>: dat is de tijd van "foto aanvaard" tot "op schijf". Doel: onder 1000 ms.</li>
+  <li>Kijk eerst onderaan: er moet <b>proef a v0.2</b> staan. Anders de pagina herladen.</li>
+  <li>Tik op <b>FOTO NEMEN</b> en neem een foto van een machine. Doe dat 6 keer; wacht telkens tot de balk groen of rood is.</li>
+  <li>Tik daarna op <b>Laatste foto 3x herhalen</b>. Dat meet hetzelfde zonder de camera ertussen.</li>
+  <li>Elke foto wordt op vier manieren verwerkt (orig, A, O, W), in milliseconden. Doel voor A, O of W: onder 1000.</li>
   <li>Sluit Chrome volledig, open de pagina opnieuw: de foto's moeten er nog staan.</li>
   <li>Kopieer het resultaat onderaan en bezorg het.</li>
 </ol>
@@ -54,7 +56,8 @@ var CONFIG = {
 <input type="file" id="cam" accept="image/*" capture="environment">
 <div id="res">Nog geen foto.</div>
 
-<table id="tab"><thead><tr><th>#</th><th>bron</th><th>lezen</th><th>verkl.</th><th>jpeg</th><th>mini</th><th>schijf</th><th>totaal</th><th>kB</th></tr></thead><tbody></tbody></table>
+<button class="sec" id="again">Laatste foto 3x herhalen (zonder camera)</button>
+<table id="tab"><thead><tr><th>#</th><th>soort</th><th>ms zichtb.</th><th>orig</th><th>A</th><th>O</th><th>W</th><th>volgorde</th><th>kB</th></tr></thead><tbody></tbody></table>
 <div id="thumbs"></div>
 
 <p><b>Optioneel:</b> stuur de laatste foto naar het proefscript (nodig voor proef c, de pdf).</p>
@@ -132,57 +135,125 @@ var CONFIG = {
     return cv;
   }
 
-  var runs = [];
-  function handle(file) {
-    var t0 = performance.now(), m = { bron: Math.round(file.size / 1024) + ' kB ' + (file.type || '?') };
-    $('res').className = ''; $('res').textContent = 'Bezig…';
-    var dec, big, rec;
+  /* ---------------- Meetvarianten (v0.2) ----------------
+     v0.1 haalde de eis van 1 s niet altijd, en de tijd van de jpeg-stap schommelde
+     van 0,2 tot 4 s op hetzelfde toestel. Elke foto loopt daarom langs vier wegen:
+       orig : het originele bestand ongewijzigd op schijf (verkleinen zou dan later gebeuren)
+       A    : canvas + toBlob op de hoofddraad (de weg van v0.1)
+       O    : OffscreenCanvas + convertToBlob op de hoofddraad
+       W    : alles in een Worker (decoderen, verkleinen, jpeg)
+     De volgorde van A, O en W wisselt per foto, zodat niet altijd dezelfde eerst is. */
+  var visibleAt = performance.now();
+  document.addEventListener('visibilitychange', function () { if (!document.hidden) visibleAt = performance.now(); });
+
+  function wegOrig(file) {
+    var t = performance.now(), key;
+    return tx('readwrite', function (s) { s.add({ ts: Date.now(), tijdelijk: true, orig: file }).onsuccess = function (e) { key = e.target.result; }; })
+      .then(function () { var ms = performance.now() - t; return tx('readwrite', function (s) { s.delete(key); }).then(function () { return { ms: ms }; }); });
+  }
+  function wegA(file) {
+    var t = performance.now();
     return decode(file).then(function (d) {
-      dec = d; m.lezen = performance.now() - t0; m.px = d.w + '×' + d.h + ' (' + d.how + ')';
-      var t1 = performance.now(), f = fit(d.w, d.h, CONFIG.MAX_SIDE);
-      big = draw(d.src, f.w, f.h); m.verkl = performance.now() - t1; m.uit = f.w + '×' + f.h;
-      var t2 = performance.now();
-      return toBlob(big, CONFIG.JPEG_QUALITY).then(function (b) { m.jpeg = performance.now() - t2; return b; });
-    }).then(function (blob) {
-      var t3 = performance.now(), f = fit(big.width, big.height, CONFIG.THUMB_SIDE);
-      return toBlob(draw(big, f.w, f.h), CONFIG.THUMB_QUALITY).then(function (th) {
-        m.mini = performance.now() - t3; dec.close();
-        rec = { ts: Date.now(), blob: blob, thumb: th, w: big.width, h: big.height };
-        var t4 = performance.now();
-        return tx('readwrite', function (s) { s.add(rec); }).then(function () { m.schijf = performance.now() - t4; });
-      });
+      var f = fit(d.w, d.h, CONFIG.MAX_SIDE);
+      return toBlob(draw(d.src, f.w, f.h), CONFIG.JPEG_QUALITY).then(function (blob) { d.close(); return { ms: performance.now() - t, blob: blob, w: f.w, h: f.h, bron: d.w + 'x' + d.h }; });
+    });
+  }
+  function wegO(file) {
+    if (!window.OffscreenCanvas || !window.createImageBitmap) return Promise.reject(new Error('geen OffscreenCanvas'));
+    var t = performance.now();
+    return createImageBitmap(file, { imageOrientation: 'from-image' }).then(function (bmp) {
+      var f = fit(bmp.width, bmp.height, CONFIG.MAX_SIDE), c = new OffscreenCanvas(f.w, f.h);
+      c.getContext('2d').drawImage(bmp, 0, 0, f.w, f.h); bmp.close();
+      return c.convertToBlob({ type: 'image/jpeg', quality: CONFIG.JPEG_QUALITY }).then(function (blob) { return { ms: performance.now() - t, blob: blob, w: f.w, h: f.h }; });
+    });
+  }
+  var worker = null;
+  function maakWorker() {
+    var code = 'onmessage = async function (e) { try {'
+      + ' var d = e.data; var bmp = await createImageBitmap(d.file, { imageOrientation: "from-image" });'
+      + ' var s = Math.min(1, d.max / Math.max(bmp.width, bmp.height)); var w = Math.round(bmp.width * s), h = Math.round(bmp.height * s);'
+      + ' var c = new OffscreenCanvas(w, h); c.getContext("2d").drawImage(bmp, 0, 0, w, h); bmp.close();'
+      + ' var blob = await c.convertToBlob({ type: "image/jpeg", quality: d.q }); postMessage({ ok: true, blob: blob, w: w, h: h });'
+      + ' } catch (err) { postMessage({ ok: false, error: String(err) }); } };';
+    return new Worker(URL.createObjectURL(new Blob([code], { type: 'text/javascript' })));
+  }
+  function wegW(file) {
+    if (!window.Worker || !window.OffscreenCanvas) return Promise.reject(new Error('geen Worker/OffscreenCanvas'));
+    if (!worker) worker = maakWorker();
+    var t = performance.now();
+    return new Promise(function (res, rej) {
+      worker.onmessage = function (e) { if (e.data.ok) res({ ms: performance.now() - t, blob: e.data.blob, w: e.data.w, h: e.data.h }); else rej(new Error(e.data.error)); };
+      worker.onerror = function (e) { rej(new Error(e.message || 'workerfout')); };
+      worker.postMessage({ file: file, max: CONFIG.MAX_SIDE, q: CONFIG.JPEG_QUALITY });
+    });
+  }
+  var WEGEN = { A: wegA, O: wegO, W: wegW };
+
+  var runs = [], lastFile = null, bezig = false;
+  function handle(file, soort) {
+    if (bezig) return Promise.resolve();
+    bezig = true; lastFile = file;
+    var m = { soort: soort, bron: Math.round(file.size / 1024) + ' kB', zicht: document.visibilityState, sindsZicht: performance.now() - visibleAt, fout: {} };
+    $('res').className = ''; $('res').textContent = 'Bezig...';
+    var orde = ['A', 'O', 'W'];
+    for (var i = 0; i < runs.length % 3; i++) orde.push(orde.shift());
+    m.orde = orde.join('');
+    var keep = null;
+    var p = wegOrig(file).then(function (x) { m.orig = x.ms; }, function (e) { m.fout.orig = String(e && e.message || e); });
+    orde.forEach(function (k) {
+      p = p.then(function () { return WEGEN[k](file); }).then(function (x) {
+        m[k] = x.ms; m.kB = Math.round(x.blob.size / 1024); m.uit = x.w + 'x' + x.h;
+        if (x.bron) m.px = x.bron;
+        if (!keep) keep = x;
+      }, function (e) { m.fout[k] = String(e && e.message || e); });
+    });
+    return p.then(function () {
+      if (!keep) throw new Error('geen enkele weg lukte: ' + JSON.stringify(m.fout));
+      // Miniatuur en bewaren: niet gemeten, alleen om de foto te houden. Herhalingen bewaren niets.
+      if (soort !== 'foto') return;
+      return createImageBitmap(keep.blob).then(function (bmp) { var f = fit(bmp.width, bmp.height, CONFIG.THUMB_SIDE); return toBlob(draw(bmp, f.w, f.h), CONFIG.THUMB_QUALITY); })
+        .then(function (th) { return tx('readwrite', function (s) { s.add({ ts: Date.now(), blob: keep.blob, thumb: th, w: keep.w, h: keep.h }); }); });
     }).then(function () {
-      m.totaal = performance.now() - t0; m.kB = Math.round(rec.blob.size / 1024);
       runs.push(m);
-      var ok = m.totaal <= CONFIG.TARGET_MS;
-      $('res').className = ok ? 'ok' : 'bad';
-      $('res').textContent = 'BEWAARD in ' + Math.round(m.totaal) + ' ms ' + (ok ? '(binnen de eis)' : '(TRAGER dan 1000 ms)') + '\nbron ' + m.px + ' → ' + m.uit + ', ' + m.kB + ' kB';
+      var best = Math.min(m.A == null ? Infinity : m.A, m.O == null ? Infinity : m.O, m.W == null ? Infinity : m.W);
+      $('res').className = best <= CONFIG.TARGET_MS ? 'ok' : 'bad';
+      $('res').textContent = (soort === 'foto' ? 'FOTO' : 'HERHALING') + ' - origineel op schijf ' + r(m.orig) + ' ms\nA ' + r(m.A) + ' / O ' + r(m.O) + ' / W ' + r(m.W) + ' ms (verkleinen + jpeg, doel onder 1000)';
       render();
-    }).catch(function (e) { $('res').className = 'bad'; $('res').textContent = 'MISLUKT: ' + (e && e.message || e); });
+    }).catch(function (e) { $('res').className = 'bad'; $('res').textContent = 'MISLUKT: ' + (e && e.message || e); })
+      .then(function () { bezig = false; });
   }
 
-  function r(n) { return n == null ? '' : Math.round(n); }
+  function r(n) { return n == null ? '-' : Math.round(n); }
   function render() {
     var tb = $('tab').tBodies[0]; tb.textContent = '';
     runs.forEach(function (m, i) {
       var tr = document.createElement('tr');
-      [i + 1, m.bron, r(m.lezen), r(m.verkl), r(m.jpeg), r(m.mini), r(m.schijf), r(m.totaal), m.kB].forEach(function (v) { var td = document.createElement('td'); td.textContent = v; tr.appendChild(td); });
+      [i + 1, m.soort === 'foto' ? 'foto' : 'herh.', r(m.sindsZicht), r(m.orig), r(m.A), r(m.O), r(m.W), m.orde, m.kB].forEach(function (v) { var td = document.createElement('td'); td.textContent = v; tr.appendChild(td); });
       tb.appendChild(tr);
     });
     tx('readonly', function (s) { var out = []; s.getAll().onsuccess = function (e) { out.push.apply(out, e.target.result || []); }; return out; }).then(function (all) {
+      all = all.filter(function (x) { return x.blob && x.thumb; });
       var box = $('thumbs'); box.textContent = '';
       var bytes = 0;
       all.forEach(function (x) { bytes += x.blob.size + x.thumb.size; var img = new Image(); img.src = URL.createObjectURL(x.thumb); box.appendChild(img); });
-      var lines = ['Proef a v' + CONFIG.PROEF_VERSION + ' – ' + new Date().toLocaleString('nl-BE'), navigator.userAgent,
-        'toestel: ' + (navigator.deviceMemory || '?') + ' GB, ' + (navigator.hardwareConcurrency || '?') + ' kernen',
-        'op schijf: ' + all.length + ' foto\'s, ' + Math.round(bytes / 1024) + ' kB'];
-      runs.forEach(function (m, i) { lines.push('#' + (i + 1) + ' bron ' + m.bron + ' ' + m.px + ' → ' + m.uit + ' ' + m.kB + ' kB | lezen ' + r(m.lezen) + ' verkl ' + r(m.verkl) + ' jpeg ' + r(m.jpeg) + ' mini ' + r(m.mini) + ' schijf ' + r(m.schijf) + ' TOTAAL ' + r(m.totaal) + ' ms'); });
-      if (navigator.storage && navigator.storage.estimate) navigator.storage.estimate().then(function (e) { lines.push('opslag: ' + Math.round((e.usage || 0) / 1048576) + ' MB gebruikt van ' + Math.round((e.quota || 0) / 1048576) + ' MB'); $('dump').value = lines.join('\n'); });
+      var lines = ['Proef a v' + CONFIG.PROEF_VERSION + ' - ' + new Date().toLocaleString('nl-BE'), navigator.userAgent,
+        'toestel: ' + (navigator.deviceMemory || '?') + ' GB, ' + (navigator.hardwareConcurrency || '?') + ' kernen, scherm ' + screen.width + 'x' + screen.height,
+        'op schijf: ' + all.length + ' foto(s), ' + Math.round(bytes / 1024) + ' kB'];
+      runs.forEach(function (m, i) {
+        lines.push('#' + (i + 1) + ' ' + m.soort + ' bron ' + m.bron + ' ' + (m.px || '') + ' -> ' + (m.uit || '?') + ' ' + (m.kB || '?') + ' kB | ' + m.zicht + ' sinds ' + r(m.sindsZicht) + ' ms | orig ' + r(m.orig) + ' | A ' + r(m.A) + ' | O ' + r(m.O) + ' | W ' + r(m.W) + ' | volgorde ' + m.orde + (Object.keys(m.fout).length ? ' | FOUT ' + JSON.stringify(m.fout) : ''));
+      });
       $('dump').value = lines.join('\n');
+      if (navigator.storage && navigator.storage.estimate) navigator.storage.estimate().then(function (e) { lines.push('opslag: ' + Math.round((e.usage || 0) / 1048576) + ' MB gebruikt van ' + Math.round((e.quota || 0) / 1048576) + ' MB'); $('dump').value = lines.join('\n'); });
     });
   }
 
-  $('cam').addEventListener('change', function () { var f = this.files && this.files[0]; this.value = ''; if (f) handle(f); });
+  $('again').addEventListener('click', function () {
+    if (!lastFile) { $('res').className = 'bad'; $('res').textContent = 'Neem eerst een foto.'; return; }
+    var f = lastFile;
+    handle(f, 'herhaling').then(function () { return handle(f, 'herhaling'); }).then(function () { return handle(f, 'herhaling'); });
+  });
+
+  $('cam').addEventListener('change', function () { var f = this.files && this.files[0]; this.value = ''; if (f) handle(f, 'foto'); });
   $('wipe').addEventListener('click', function () { tx('readwrite', function (s) { s.clear(); }).then(function () { runs = []; $('res').className = ''; $('res').textContent = 'Gewist.'; render(); }); });
 
   function b64(blob) { return new Promise(function (res, rej) { var fr = new FileReader(); fr.onload = function () { res(String(fr.result).split(',')[1]); }; fr.onerror = rej; fr.readAsDataURL(blob); }); }
@@ -190,7 +261,7 @@ var CONFIG = {
     saveSettings();
     if (!settings.url || !settings.key) { $('res').className = 'bad'; $('res').textContent = 'Vul eerst het adres en de proefsleutel in.'; return; }
     tx('readonly', function (s) { var out = {}; s.openCursor(null, 'prev').onsuccess = function (e) { if (e.target.result) out.rec = e.target.result.value; }; return out; }).then(function (o) {
-      if (!o.rec) throw new Error('nog geen foto');
+      if (!o.rec || !o.rec.blob) throw new Error('nog geen foto');
       $('res').className = ''; $('res').textContent = 'Verzenden…';
       var t0 = performance.now();
       return b64(o.rec.blob).then(function (data) {
